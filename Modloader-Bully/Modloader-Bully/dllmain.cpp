@@ -87,7 +87,7 @@ void LoadSettings() {
         // If INI doesn't exist, create it with default settings
         fs::create_directories(MODLOADER_DIR);
         WritePrivateProfileStringA("Settings", "Debug", "0", MODLOADER_INI.c_str());
-        g_EnableLogging = true;
+        g_EnableLogging = false;
     }
     else {
         // Read the Debug value
