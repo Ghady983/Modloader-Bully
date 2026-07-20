@@ -1,0 +1,7 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="Modloader-Bully/Modloader-Bully.vcxproj" Id="6ce8ed87-215b-4492-b455-e08679d627c7" />
+</Solution>
