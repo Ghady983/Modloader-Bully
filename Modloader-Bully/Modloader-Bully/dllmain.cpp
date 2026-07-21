@@ -18,7 +18,7 @@ namespace fs = std::filesystem;
 // CONFIGURATION & GLOBALS
 // ============================================================================
 const std::string MODLOADER_DIR = "modloader/";
-const std::string MODLOADER_INI = "modloader/modloader.ini"; // NEW: Config file
+const std::string MODLOADER_INI = "modloader/modloader.ini";
 const std::string CUSTOM_DIR_FOLDER = "modloader/.dir/";
 const std::string DATA_DIR = "modloader/.data/";
 const std::string PRIORITY_INI = "modloader/.data/priority.ini";
@@ -29,7 +29,7 @@ const uint32_t FAKE_OFFSET_START = 0x00080000;
 const int DEFAULT_PRIORITY = 50;
 
 CRITICAL_SECTION g_CriticalSection;
-bool g_EnableLogging = true; // NEW: Logging toggle
+bool g_EnableLogging = true;
 
 // --- Data Structures ---
 struct FileCandidate {
@@ -80,17 +80,13 @@ OriginalGetFileAttributesW_t OriginalGetFileAttributesW = nullptr;
 // ============================================================================
 // LOGGING & SETTINGS
 // ============================================================================
-
-// NEW: Load settings from modloader.ini
 void LoadSettings() {
     if (!fs::exists(MODLOADER_INI)) {
-        // If INI doesn't exist, create it with default settings
         fs::create_directories(MODLOADER_DIR);
         WritePrivateProfileStringA("Settings", "Debug", "0", MODLOADER_INI.c_str());
         g_EnableLogging = false;
     }
     else {
-        // Read the Debug value
         char buffer[16];
         GetPrivateProfileStringA("Settings", "Debug", "1", buffer, sizeof(buffer), MODLOADER_INI.c_str());
         g_EnableLogging = (std::string(buffer) == "1");
@@ -98,9 +94,7 @@ void LoadSettings() {
 }
 
 void Log(const std::string& message) {
-    // If logging is disabled, exit immediately to save performance
     if (!g_EnableLogging) return;
-
     EnterCriticalSection(&g_CriticalSection);
     std::ofstream logFile(LOG_FILE, std::ios::app);
     if (logFile.is_open()) logFile << message << std::endl;
@@ -304,7 +298,7 @@ void ProcessElectionResults() {
 }
 
 // ============================================================================
-// THE HOOKS (Pure VFS Focus)
+// THE HOOKS
 // ============================================================================
 std::string ResolveAndRedirectPath(const std::string& requestedPath) {
     char absPath[MAX_PATH];
@@ -333,7 +327,10 @@ HANDLE WINAPI HookedCreateFileA(LPCSTR lpFileName, DWORD dwDesiredAccess, DWORD 
             if (hFile != INVALID_HANDLE_VALUE) {
                 std::string key = ExtractIMGKey(redirectedPath);
                 if (key.length() > 4 && key.substr(key.length() - 4) == ".img") {
-                    EnterCriticalSection(&g_CriticalSection); g_IMGHandles[hFile] = key; LeaveCriticalSection(&g_CriticalSection);
+                    EnterCriticalSection(&g_CriticalSection);
+                    g_IMGHandles[hFile] = key;
+                    g_CurrentOffset[hFile] = 0; // FIX: Initialize offset
+                    LeaveCriticalSection(&g_CriticalSection);
                 }
             }
             return hFile;
@@ -342,7 +339,10 @@ HANDLE WINAPI HookedCreateFileA(LPCSTR lpFileName, DWORD dwDesiredAccess, DWORD 
         if (hFile != INVALID_HANDLE_VALUE) {
             std::string key = ExtractIMGKey(lpFileName);
             if (key.length() > 4 && key.substr(key.length() - 4) == ".img") {
-                EnterCriticalSection(&g_CriticalSection); g_IMGHandles[hFile] = key; LeaveCriticalSection(&g_CriticalSection);
+                EnterCriticalSection(&g_CriticalSection);
+                g_IMGHandles[hFile] = key;
+                g_CurrentOffset[hFile] = 0; // FIX: Initialize offset
+                LeaveCriticalSection(&g_CriticalSection);
             }
         }
         return hFile;
@@ -361,7 +361,10 @@ HANDLE WINAPI HookedCreateFileW(LPCWSTR lpFileName, DWORD dwDesiredAccess, DWORD
             if (hFile != INVALID_HANDLE_VALUE) {
                 std::string key = ExtractIMGKey(redirectedPath);
                 if (key.length() > 4 && key.substr(key.length() - 4) == ".img") {
-                    EnterCriticalSection(&g_CriticalSection); g_IMGHandles[hFile] = key; LeaveCriticalSection(&g_CriticalSection);
+                    EnterCriticalSection(&g_CriticalSection);
+                    g_IMGHandles[hFile] = key;
+                    g_CurrentOffset[hFile] = 0; // FIX: Initialize offset
+                    LeaveCriticalSection(&g_CriticalSection);
                 }
             }
             return hFile;
@@ -370,7 +373,10 @@ HANDLE WINAPI HookedCreateFileW(LPCWSTR lpFileName, DWORD dwDesiredAccess, DWORD
         if (hFile != INVALID_HANDLE_VALUE) {
             std::string key = ExtractIMGKey(path);
             if (key.length() > 4 && key.substr(key.length() - 4) == ".img") {
-                EnterCriticalSection(&g_CriticalSection); g_IMGHandles[hFile] = key; LeaveCriticalSection(&g_CriticalSection);
+                EnterCriticalSection(&g_CriticalSection);
+                g_IMGHandles[hFile] = key;
+                g_CurrentOffset[hFile] = 0; // FIX: Initialize offset
+                LeaveCriticalSection(&g_CriticalSection);
             }
         }
         return hFile;
@@ -445,6 +451,10 @@ BOOL WINAPI HookedReadFile(HANDLE hFile, LPVOID lpBuffer, DWORD nBytesToRead, LP
                 DWORD bytesRead = static_cast<DWORD>(modFile.gcount());
                 if (pBytesRead) *pBytesRead = bytesRead;
                 if (lpOver && lpOver->hEvent) SetEvent(lpOver->hEvent);
+
+                // FIX: Advance offset for sequential reads
+                if (!lpOver) g_CurrentOffset[hFile] += bytesRead;
+
                 LeaveCriticalSection(&g_CriticalSection); return TRUE;
             }
         }
@@ -461,6 +471,10 @@ BOOL WINAPI HookedReadFile(HANDLE hFile, LPVOID lpBuffer, DWORD nBytesToRead, LP
                     DWORD bytesRead = static_cast<DWORD>(modFile.gcount());
                     if (pBytesRead) *pBytesRead = bytesRead;
                     if (lpOver && lpOver->hEvent) SetEvent(lpOver->hEvent);
+
+                    // FIX: Advance offset for sequential reads
+                    if (!lpOver) g_CurrentOffset[hFile] += bytesRead;
+
                     LeaveCriticalSection(&g_CriticalSection); return TRUE;
                 }
             }
@@ -471,15 +485,11 @@ BOOL WINAPI HookedReadFile(HANDLE hFile, LPVOID lpBuffer, DWORD nBytesToRead, LP
 }
 
 // ============================================================================
-// INITIALIZATION
+// INITIALIZATION & ENTRY POINT
 // ============================================================================
 void InitializeHooks() {
-    InitializeCriticalSection(&g_CriticalSection);
-
-    // NEW: Load settings BEFORE doing anything else
     LoadSettings();
 
-    // Only clear the log file if logging is enabled
     if (g_EnableLogging) {
         std::ofstream(LOG_FILE, std::ios::trunc).close();
     }
@@ -506,10 +516,19 @@ void InitializeHooks() {
     Log("All hooks enabled. Modloader is fully ready.");
 }
 
+// FIX: Run initialization in a background thread to prevent Loader Lock crashes
+DWORD WINAPI ModloaderThread(LPVOID) {
+    Sleep(1000); // Give the game time to finish its own fragile startup
+    InitializeHooks();
+    return 0;
+}
+
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {
     if (ul_reason_for_call == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hModule);
-        InitializeHooks();
+        InitializeCriticalSection(&g_CriticalSection);
+        // FIX: Do NOT call InitializeHooks() directly here! It causes silent crashes.
+        CreateThread(NULL, 0, ModloaderThread, NULL, 0, NULL);
     }
     else if (ul_reason_for_call == DLL_PROCESS_DETACH) {
         MH_Uninitialize();
