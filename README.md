@@ -152,3 +152,6 @@ This project is still in Development , So you might expect some bugs. I am still
 ## ⚖️ License
 
 This project is provided as-is for educational and personal modding purposes. Bully: Scholarship Edition is © Rockstar Games.
+
+---
+[![Donate on Patreon](https://img.shields.io/badge/Patreon-Donate-F96854?style=for-the-badge&logo=patreon&logoColor=white)](https://patreon.com/ghady983)
