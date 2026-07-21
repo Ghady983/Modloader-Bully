@@ -41,6 +41,8 @@ Replace, resize, and add files inside `.img` archives and the game's root direct
 3. This is a possible perceived bug I found , if you're making an `.nft` (Texture) modification : it will not show any changes if you don't also provide the `.nif` (3d Model) with it. And the opposite goes to if you are making an `.nif` mod , you must provide also the `.nft` file with it or else no texture will show.
 That's why the mod works best with `.nif + .nft` combination
 
+4. Some mods may crash the game if you add them (tried with `PS2 and Wii Trees by EpigreZr` and `Beautiful HD Retextured Radar Map by SkillaG`), although if you add only some parts of the mod into the game then no crash might happen (I tried adding `G_ClimbTree` `.nft` and `TreeClimb` `.nif` files from the `PS2 and Wii Trees by EpigreZr` mod -> that would be the climbing tree at the football stadium at school in case you wanna test it yourself). Maybe it has to do with the amount of things added inside a specific modfolder , or it has to do with specific files in particular, or the issue is completely unrelated to both.
+
 ---
 
 ## 📂 Usage & Folder Structure
