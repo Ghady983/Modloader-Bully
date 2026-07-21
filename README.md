@@ -55,7 +55,7 @@ Bully/
     ├── .data/
     │   └── mods.ini     <-- Mod load order and status of each mod
     ├── .dir/
-        └── Stream/
+    │   └── Stream/
     │       └── world.dir    <-- Auto-generated custom .dir (do not edit)
     ├── MyMod/               <-- A mod folder (acts as virtual game root)
     │   └── Stream/
