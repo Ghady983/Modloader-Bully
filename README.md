@@ -53,9 +53,10 @@ Bully/
 └── modloader/
     ├── modloader.ini        <-- Global settings (Debug toggle)
     ├── .data/
-    │   └── priority.ini     <-- Mod load order (auto-generated)
+    │   └── mods.ini     <-- Mod load order and status of each mod
     ├── .dir/
-    │   └── world.dir        <-- Auto-generated custom .dir (do not edit)
+        └── Stream/
+    │       └── world.dir    <-- Auto-generated custom .dir (do not edit)
     ├── MyMod/               <-- A mod folder (acts as virtual game root)
     │   └── Stream/
     │       └── world.img/
