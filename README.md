@@ -35,7 +35,11 @@ Replace, resize, and add files inside `.img` archives and the game's root direct
 ## 🔧 Known Bugs 
 
 1. Sometimes some mods might not work or the game might crash : to solve this try deleting the `.dir` folder in `modloader` folder.
+
 2. Upon updating the modloader , sometimes you might wanna delete the `.data` folder too (since I would have added modifications to it) but note this removes the priority list you made in the previous version
+
+3. This is a possible perceived bug I found , if you're making an `.nft` (Texture) modification : it will now show any changes if you don't also provide the `.nif` (3d Model) with it. And the opposite goes to if you are making an `.nif` mod , you must provide also the `.nft` file with it or else no texture will show.
+That's why the mod works best with `.nif + .nft` combination
 
 ---
 
