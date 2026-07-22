@@ -128,7 +128,17 @@ std::string FindOriginalDir(const std::string& imgKey) {
     size_t lastSlash = baseName.find_last_of("/\\");
     if (lastSlash != std::string::npos) baseName = baseName.substr(lastSlash + 1);
     std::string dirFileName = baseName.substr(0, baseName.length() - 4) + ".dir";
-    std::vector<std::string> searchPaths = { "Stream/" + dirFileName, "stream/" + dirFileName, dirFileName, "Dat/" + dirFileName, "dat/" + dirFileName, "Objects/" + dirFileName, "Scripts/" + dirFileName, "Act/" + dirFileName };
+
+    std::vector<std::string> searchPaths = {
+        "Stream/" + dirFileName, "stream/" + dirFileName,
+        "Config/" + dirFileName, "config/" + dirFileName,
+        "Cuts/" + dirFileName, "cuts/" + dirFileName,
+        dirFileName,
+        "Dat/" + dirFileName, "dat/" + dirFileName, "DAT/" + dirFileName,
+        "Objects/" + dirFileName, "objects/" + dirFileName,
+        "Scripts/" + dirFileName, "scripts/" + dirFileName,
+        "Act/" + dirFileName, "act/" + dirFileName
+    };
     for (const auto& p : searchPaths) if (fs::exists(p)) return p;
     return "";
 }
