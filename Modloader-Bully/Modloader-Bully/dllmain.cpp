@@ -33,6 +33,12 @@ struct FileCandidate {
     uintmax_t fileSize;
 };
 
+struct LooseFileCandidate {
+    std::string modPath;
+    int priority;
+    fs::file_time_type modTime;
+};
+
 struct StandardReplacement { std::string modPath; uint32_t originalSize; };
 struct VirtualEntry { std::string name; std::string modPath; uint32_t sizeInSectors; };
 
@@ -40,6 +46,7 @@ std::map<std::string, std::map<uint32_t, StandardReplacement>> g_StandardReplace
 std::map<std::string, std::map<uint32_t, VirtualEntry>> g_VirtualEntries;
 std::map<uint32_t, VirtualEntry*> g_FakeOffsetLookup;
 std::map<std::string, std::string> g_DirRedirections;
+std::map<std::string, LooseFileCandidate> g_LooseFiles; // NEW: For loose file replacements
 std::map<HANDLE, std::string> g_IMGHandles;
 std::map<HANDLE, uint32_t> g_CurrentOffset;
 
@@ -112,7 +119,7 @@ void InitPaths() {
 }
 
 // ============================================================================
-// SCANNING & DIR GENERATION (Simplified & Reliable)
+// SCANNING & DIR GENERATION
 // ============================================================================
 void EnsureModInIni(const std::string& modName) {
     char buffer[64];
@@ -129,6 +136,7 @@ std::string FindOriginalDir(const std::string& imgKey) {
     if (lastSlash != std::string::npos) baseName = baseName.substr(lastSlash + 1);
     std::string dirFileName = baseName.substr(0, baseName.length() - 4) + ".dir";
 
+    // Expanded search paths to include UI, Fonts, Menus, etc.
     std::vector<std::string> searchPaths = {
         "Stream/" + dirFileName, "stream/" + dirFileName,
         "Config/" + dirFileName, "config/" + dirFileName,
@@ -172,6 +180,7 @@ void ScanAndProcessMods() {
             std::string lowerPath = ToLower(file.path().string());
 
             size_t imgPos = lowerPath.find(".img");
+            // Check if it's inside an .img folder
             if (imgPos != std::string::npos && imgPos + 4 < lowerPath.size() && (lowerPath[imgPos + 4] == '/' || lowerPath[imgPos + 4] == '\\')) {
                 std::string beforeImg = lowerPath.substr(0, imgPos);
                 size_t startKey = beforeImg.find_last_of("/\\");
@@ -188,6 +197,28 @@ void ScanAndProcessMods() {
 
                 if (shouldReplace) {
                     imgMap[fileName] = { file.path().string(), priority, file.last_write_time(), fs::file_size(file.path()) };
+                }
+            }
+            // NEW: Otherwise, treat it as a loose file replacement
+            else {
+                std::string relPath = fs::relative(file.path(), entry.path()).string();
+                std::string relLower = ToLower(relPath);
+
+                auto it = g_LooseFiles.find(relLower);
+                bool shouldReplaceLoose = false;
+
+                if (it == g_LooseFiles.end()) {
+                    shouldReplaceLoose = true;
+                }
+                else if (priority > it->second.priority) {
+                    shouldReplaceLoose = true;
+                }
+                else if (priority == it->second.priority && file.last_write_time() < it->second.modTime) {
+                    shouldReplaceLoose = true;
+                }
+
+                if (shouldReplaceLoose) {
+                    g_LooseFiles[relLower] = { file.path().string(), priority, file.last_write_time() };
                 }
             }
         }
@@ -267,10 +298,25 @@ void ScanAndProcessMods() {
 // THE HOOKS
 // ============================================================================
 std::string ResolveAndRedirectPath(const std::string& requestedPath) {
-    char absPath[MAX_PATH]; GetFullPathNameA(requestedPath.c_str(), MAX_PATH, absPath, NULL);
+    char absPath[MAX_PATH];
+    GetFullPathNameA(requestedPath.c_str(), MAX_PATH, absPath, NULL);
     std::string absLower = ToLower(absPath);
+
     if (absLower.find(g_ModloaderLower) != std::string::npos) return "";
-    for (const auto& pair : g_DirRedirections) if (absLower.find(pair.first) != std::string::npos) return pair.second;
+
+    for (const auto& pair : g_DirRedirections) {
+        if (absLower.find(pair.first) != std::string::npos) return pair.second;
+    }
+
+    // NEW: Check if it's a loose file in the game root
+    if (absLower.find(g_GameRootLower) == 0) {
+        std::string relLower = absLower.substr(g_GameRootLower.length());
+        auto it = g_LooseFiles.find(relLower);
+        if (it != g_LooseFiles.end()) {
+            return it->second.modPath;
+        }
+    }
+
     return "";
 }
 
@@ -344,7 +390,6 @@ DWORD WINAPI HookedGetFileAttributesW(LPCWSTR lpFileName) {
 
 BOOL WINAPI HookedReadFile(HANDLE hFile, LPVOID lpBuffer, DWORD nBytesToRead, LPDWORD pBytesRead, LPOVERLAPPED lpOver) {
     std::string modPath = "";
-    uint32_t currentOffset = 0;
     bool isOverlapped = (lpOver != nullptr);
 
     EnterCriticalSection(&g_CriticalSection);
@@ -352,7 +397,6 @@ BOOL WINAPI HookedReadFile(HANDLE hFile, LPVOID lpBuffer, DWORD nBytesToRead, LP
     if (it != g_IMGHandles.end()) {
         std::string imgKey = it->second;
         uint32_t offset = isOverlapped ? lpOver->Offset : g_CurrentOffset[hFile];
-        currentOffset = offset;
         uint32_t sectorOffset = offset / SECTOR_SIZE;
 
         auto virtIt = g_FakeOffsetLookup.find(sectorOffset);
