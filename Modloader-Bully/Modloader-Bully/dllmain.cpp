@@ -23,7 +23,8 @@ const std::string LOG_FILE = "modloader.txt";
 
 const uint32_t SECTOR_SIZE = 2048;
 const uint32_t FAKE_OFFSET_START = 0x00080000;
-const uint32_t MAX_FAKE_SECTOR = 0x7FFFFFFF / SECTOR_SIZE;
+const uint32_t MAX_FAKE_SECTOR = 0xFFFFFFFE / SECTOR_SIZE;
+const DWORD MAX_IMG_SIZE = 0xFFFFFFFE;
 
 CRITICAL_SECTION g_CriticalSection;
 bool g_EnableLogging = true;
@@ -305,7 +306,28 @@ void ScanAndProcessMods() {
             origMap[ToLower(name)] = &newDirEntries.back();
         }
 
+        fs::path originalImgPath = fs::path(g_GameRoot) / originalDirPath;
+        originalImgPath.replace_extension(".img");
+        std::error_code archiveError;
         uint64_t nextFakeSector = FAKE_OFFSET_START;
+        bool archiveUsable = fs::is_regular_file(originalImgPath, archiveError) && !archiveError;
+        if (archiveUsable) {
+            uint64_t archiveSize = fs::file_size(originalImgPath, archiveError);
+            if (!archiveError) {
+                uint64_t archiveEndSector = archiveSize / SECTOR_SIZE +
+                    (archiveSize % SECTOR_SIZE != 0) + 1;
+                nextFakeSector = (std::max)(nextFakeSector, archiveEndSector);
+                Log("[" + imgKey + "] Virtual sectors start at " +
+                    std::to_string(nextFakeSector) + " after " +
+                    std::to_string(archiveSize) + " archive bytes.");
+            }
+            else archiveUsable = false;
+        }
+        if (!archiveUsable) {
+            nextFakeSector = static_cast<uint64_t>(MAX_FAKE_SECTOR) + 1;
+            Log("ERROR: Unable to locate original archive for [" + imgKey +
+                "]; virtual entries will be skipped.");
+        }
         int stdCount = 0, virtCount = 0;
 
         for (const auto& filePair : imgPair.second) {
@@ -454,13 +476,13 @@ BOOL WINAPI HookedSetFilePointerEx(HANDLE hFile, LARGE_INTEGER liDist, PLARGE_IN
 
 DWORD WINAPI HookedGetFileSize(HANDLE hFile, LPDWORD lpFileSizeHigh) {
     bool isIMG = false; EnterCriticalSection(&g_CriticalSection); if (g_IMGHandles.count(hFile)) isIMG = true; LeaveCriticalSection(&g_CriticalSection);
-    if (isIMG) { if (lpFileSizeHigh) *lpFileSizeHigh = 0; return 0x7FFFFFFF; }
+    if (isIMG) { if (lpFileSizeHigh) *lpFileSizeHigh = 0; return MAX_IMG_SIZE; }
     return OriginalGetFileSize(hFile, lpFileSizeHigh);
 }
 
 BOOL WINAPI HookedGetFileSizeEx(HANDLE hFile, PLARGE_INTEGER lpFileSize) {
     bool isIMG = false; EnterCriticalSection(&g_CriticalSection); if (g_IMGHandles.count(hFile)) isIMG = true; LeaveCriticalSection(&g_CriticalSection);
-    if (isIMG) { lpFileSize->QuadPart = 0x7FFFFFFF; return TRUE; }
+    if (isIMG) { lpFileSize->QuadPart = MAX_IMG_SIZE; return TRUE; }
     return OriginalGetFileSizeEx(hFile, lpFileSize);
 }
 
