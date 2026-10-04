@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <algorithm>
 #include <map>
+#include <set>
 #include <vector>
 #include <cstring>
 #include "MinHook.h"
@@ -22,6 +23,7 @@ const std::string LOG_FILE = "modloader.txt";
 
 const uint32_t SECTOR_SIZE = 2048;
 const uint32_t FAKE_OFFSET_START = 0x00080000;
+const uint32_t MAX_FAKE_SECTOR = 0x7FFFFFFF / SECTOR_SIZE;
 
 CRITICAL_SECTION g_CriticalSection;
 bool g_EnableLogging = true;
@@ -39,16 +41,20 @@ struct LooseFileCandidate {
     fs::file_time_type modTime;
 };
 
-struct StandardReplacement { std::string modPath; uint32_t originalSize; };
-struct VirtualEntry { std::string name; std::string modPath; uint32_t sizeInSectors; };
+struct StandardReplacement { std::string modPath; uint64_t originalSize; uint64_t modSize; };
+struct VirtualEntry { std::string name; std::string modPath; uint32_t sizeInSectors; uint64_t modSize; };
 
-std::map<std::string, std::map<uint32_t, StandardReplacement>> g_StandardReplacements;
+std::map<std::string, std::map<uint64_t, StandardReplacement>> g_StandardReplacements;
 std::map<std::string, std::map<uint32_t, VirtualEntry>> g_VirtualEntries;
-std::map<uint32_t, VirtualEntry*> g_FakeOffsetLookup;
+std::map<std::string, std::string> g_OriginalDirCache;
 std::map<std::string, std::string> g_DirRedirections;
 std::map<std::string, LooseFileCandidate> g_LooseFiles; // NEW: For loose file replacements
 std::map<HANDLE, std::string> g_IMGHandles;
-std::map<HANDLE, uint32_t> g_CurrentOffset;
+std::map<HANDLE, std::string> g_IMGPaths;
+std::map<HANDLE, uint64_t> g_CurrentOffset;
+std::set<std::string> g_LoggedReplacementReads;
+struct CompletionPortAssociation { HANDLE port; ULONG_PTR completionKey; };
+std::map<HANDLE, CompletionPortAssociation> g_CompletionPortAssociations;
 
 std::string g_GameRoot, g_GameRootLower, g_ModloaderLower;
 
@@ -71,6 +77,8 @@ typedef DWORD(WINAPI* OrigGetFileAttributesA_t)(LPCSTR);
 OrigGetFileAttributesA_t OriginalGetFileAttributesA = nullptr;
 typedef DWORD(WINAPI* OrigGetFileAttributesW_t)(LPCWSTR);
 OrigGetFileAttributesW_t OriginalGetFileAttributesW = nullptr;
+typedef HANDLE(WINAPI* OrigCreateIoCompletionPort_t)(HANDLE, HANDLE, ULONG_PTR, DWORD);
+OrigCreateIoCompletionPort_t OriginalCreateIoCompletionPort = nullptr;
 
 // ============================================================================
 // LOGGING & HELPERS
@@ -134,7 +142,11 @@ std::string FindOriginalDir(const std::string& imgKey) {
     std::string baseName = imgKey;
     size_t lastSlash = baseName.find_last_of("/\\");
     if (lastSlash != std::string::npos) baseName = baseName.substr(lastSlash + 1);
+    if (baseName.length() <= 4) return "";
     std::string dirFileName = baseName.substr(0, baseName.length() - 4) + ".dir";
+    std::string cacheKey = ToLower(dirFileName);
+    auto cachedDir = g_OriginalDirCache.find(cacheKey);
+    if (cachedDir != g_OriginalDirCache.end()) return cachedDir->second;
 
     // Expanded search paths to include UI, Fonts, Menus, etc.
     std::vector<std::string> searchPaths = {
@@ -147,7 +159,43 @@ std::string FindOriginalDir(const std::string& imgKey) {
         "Scripts/" + dirFileName, "scripts/" + dirFileName,
         "Act/" + dirFileName, "act/" + dirFileName
     };
-    for (const auto& p : searchPaths) if (fs::exists(p)) return p;
+    for (const auto& p : searchPaths) {
+        fs::path candidate = fs::path(g_GameRoot) / p;
+        if (fs::exists(candidate)) {
+            g_OriginalDirCache[cacheKey] = p;
+            return p;
+        }
+    }
+
+    std::error_code error;
+    fs::recursive_directory_iterator it(
+        g_GameRoot,
+        fs::directory_options::skip_permission_denied,
+        error);
+    const fs::recursive_directory_iterator end;
+    while (!error && it != end) {
+        const fs::path currentPath = it->path();
+        std::string relativePath = ToLower(fs::relative(currentPath, g_GameRoot, error).string());
+        if (error) {
+            error.clear();
+            it.increment(error);
+            continue;
+        }
+        if (relativePath == "modloader" || relativePath.find("modloader/") == 0) {
+            if (it->is_directory(error)) it.disable_recursion_pending();
+            error.clear();
+        }
+        else if (it->is_regular_file(error) && ToLower(currentPath.filename().string()) == cacheKey) {
+            std::string result = fs::relative(currentPath, g_GameRoot, error).string();
+            if (!error) {
+                g_OriginalDirCache[cacheKey] = result;
+                return result;
+            }
+            error.clear();
+        }
+        it.increment(error);
+    }
+    g_OriginalDirCache[cacheKey] = "";
     return "";
 }
 
@@ -233,12 +281,20 @@ void ScanAndProcessMods() {
         std::string originalDirPath = FindOriginalDir(imgKey);
         if (originalDirPath.empty()) continue;
 
-        std::ifstream origDirFile(originalDirPath, std::ios::binary);
+        std::ifstream origDirFile(fs::path(g_GameRoot) / originalDirPath, std::ios::binary);
+        if (!origDirFile.is_open()) {
+            Log("ERROR: Unable to open archive directory: " + originalDirPath);
+            continue;
+        }
         std::vector<char> origDirData((std::istreambuf_iterator<char>(origDirFile)), std::istreambuf_iterator<char>());
         origDirFile.close();
-        if (origDirData.size() % 32 != 0) continue;
+        if (origDirData.size() % 32 != 0) {
+            Log("ERROR: Invalid archive directory size: " + originalDirPath);
+            continue;
+        }
 
         std::vector<DirEntry32> newDirEntries;
+        newDirEntries.reserve(origDirData.size() / 32 + imgPair.second.size());
         std::map<std::string, DirEntry32*> origMap;
 
         for (size_t i = 0; i < origDirData.size() / 32; i++) {
@@ -249,35 +305,52 @@ void ScanAndProcessMods() {
             origMap[ToLower(name)] = &newDirEntries.back();
         }
 
-        uint32_t nextFakeSector = FAKE_OFFSET_START;
+        uint64_t nextFakeSector = FAKE_OFFSET_START;
         int stdCount = 0, virtCount = 0;
 
         for (const auto& filePair : imgPair.second) {
             const std::string& lowerName = filePair.first;
             const FileCandidate& data = filePair.second;
-            uint32_t modSizeSectors = static_cast<uint32_t>((data.fileSize + SECTOR_SIZE - 1) / SECTOR_SIZE);
+            uint64_t modSizeSectors64 = data.fileSize / SECTOR_SIZE + (data.fileSize % SECTOR_SIZE != 0);
+            if (modSizeSectors64 > UINT32_MAX) {
+                Log("Skipping oversized mod file [" + imgKey + "]: " + lowerName);
+                continue;
+            }
+            uint32_t modSizeSectors = static_cast<uint32_t>(std::max<uint64_t>(modSizeSectors64, 1));
             auto it = origMap.find(lowerName);
 
             if (it != origMap.end()) {
                 DirEntry32* origEntry = it->second;
                 if (modSizeSectors <= origEntry->size) {
-                    g_StandardReplacements[imgKey][origEntry->offset * SECTOR_SIZE] = { data.modPath, origEntry->size * SECTOR_SIZE };
+                    g_StandardReplacements[imgKey][static_cast<uint64_t>(origEntry->offset) * SECTOR_SIZE] = {
+                        data.modPath,
+                        static_cast<uint64_t>(origEntry->size) * SECTOR_SIZE,
+                        data.fileSize
+                    };
                     stdCount++;
                 }
                 else {
-                    g_VirtualEntries[imgKey][nextFakeSector] = { lowerName, data.modPath, modSizeSectors };
-                    g_FakeOffsetLookup[nextFakeSector] = &g_VirtualEntries[imgKey][nextFakeSector];
-                    origEntry->offset = nextFakeSector; origEntry->size = modSizeSectors;
-                    nextFakeSector++; virtCount++;
+                    if (nextFakeSector + modSizeSectors - 1 > MAX_FAKE_SECTOR) {
+                        Log("Skipping oversized virtual entry [" + imgKey + "]: " + lowerName);
+                        continue;
+                    }
+                    uint32_t fakeSector = static_cast<uint32_t>(nextFakeSector);
+                    g_VirtualEntries[imgKey][fakeSector] = { lowerName, data.modPath, modSizeSectors, data.fileSize };
+                    origEntry->offset = fakeSector; origEntry->size = modSizeSectors;
+                    nextFakeSector += modSizeSectors; virtCount++;
                 }
             }
             else {
-                g_VirtualEntries[imgKey][nextFakeSector] = { lowerName, data.modPath, modSizeSectors };
-                g_FakeOffsetLookup[nextFakeSector] = &g_VirtualEntries[imgKey][nextFakeSector];
-                DirEntry32 newEntry = { nextFakeSector, modSizeSectors, {} };
-                strncpy(newEntry.name, lowerName.c_str(), 23); newEntry.name[23] = '\0';
+                if (nextFakeSector + modSizeSectors - 1 > MAX_FAKE_SECTOR) {
+                    Log("Skipping oversized virtual entry [" + imgKey + "]: " + lowerName);
+                    continue;
+                }
+                uint32_t fakeSector = static_cast<uint32_t>(nextFakeSector);
+                g_VirtualEntries[imgKey][fakeSector] = { lowerName, data.modPath, modSizeSectors, data.fileSize };
+                DirEntry32 newEntry = { fakeSector, modSizeSectors, {} };
+                strncpy(newEntry.name, lowerName.c_str(), sizeof(newEntry.name));
                 newDirEntries.push_back(newEntry);
-                nextFakeSector++; virtCount++;
+                nextFakeSector += modSizeSectors; virtCount++;
             }
         }
 
@@ -289,8 +362,10 @@ void ScanAndProcessMods() {
         if (outDir.is_open()) {
             outDir.write(reinterpret_cast<const char*>(newDirEntries.data()), newDirEntries.size() * 32);
             outDir.close();
-            g_DirRedirections[ToLower(originalDirPath)] = customDirPath;
+            if (outDir) g_DirRedirections[ToLower(originalDirPath)] = customDirPath;
+            else Log("ERROR: Unable to write generated archive directory: " + customDirPath);
         }
+        else Log("ERROR: Unable to create generated archive directory: " + customDirPath);
     }
 }
 
@@ -327,7 +402,11 @@ HANDLE WINAPI HookedCreateFileA(LPCSTR lpFileName, DWORD dwDesiredAccess, DWORD 
     if (hFile != INVALID_HANDLE_VALUE) {
         std::string key = ExtractIMGKey(r.empty() ? lpFileName : r);
         if (key.length() > 4 && key.substr(key.length() - 4) == ".img") {
-            EnterCriticalSection(&g_CriticalSection); g_IMGHandles[hFile] = key; g_CurrentOffset[hFile] = 0; LeaveCriticalSection(&g_CriticalSection);
+            EnterCriticalSection(&g_CriticalSection);
+            g_IMGHandles[hFile] = key;
+            g_IMGPaths[hFile] = r.empty() ? lpFileName : r;
+            g_CurrentOffset[hFile] = 0;
+            LeaveCriticalSection(&g_CriticalSection);
         }
     }
     return hFile;
@@ -344,7 +423,11 @@ HANDLE WINAPI HookedCreateFileW(LPCWSTR lpFileName, DWORD dwDesiredAccess, DWORD
     if (hFile != INVALID_HANDLE_VALUE) {
         std::string key = ExtractIMGKey(r.empty() ? path : r);
         if (key.length() > 4 && key.substr(key.length() - 4) == ".img") {
-            EnterCriticalSection(&g_CriticalSection); g_IMGHandles[hFile] = key; g_CurrentOffset[hFile] = 0; LeaveCriticalSection(&g_CriticalSection);
+            EnterCriticalSection(&g_CriticalSection);
+            g_IMGHandles[hFile] = key;
+            g_IMGPaths[hFile] = r.empty() ? path : r;
+            g_CurrentOffset[hFile] = 0;
+            LeaveCriticalSection(&g_CriticalSection);
         }
     }
     return hFile;
@@ -352,13 +435,20 @@ HANDLE WINAPI HookedCreateFileW(LPCWSTR lpFileName, DWORD dwDesiredAccess, DWORD
 
 DWORD WINAPI HookedSetFilePointer(HANDLE hFile, LONG lDist, PLONG pDistHigh, DWORD dwMethod) {
     DWORD res = OriginalSetFilePointer(hFile, lDist, pDistHigh, dwMethod);
-    if (res != INVALID_SET_FILE_POINTER) { EnterCriticalSection(&g_CriticalSection); if (g_IMGHandles.count(hFile)) g_CurrentOffset[hFile] = res; LeaveCriticalSection(&g_CriticalSection); }
+    DWORD error = GetLastError();
+    if (res != INVALID_SET_FILE_POINTER || error == NO_ERROR) {
+        uint64_t offset = static_cast<uint64_t>(res);
+        if (pDistHigh) offset |= static_cast<uint64_t>(static_cast<uint32_t>(*pDistHigh)) << 32;
+        EnterCriticalSection(&g_CriticalSection);
+        if (g_IMGHandles.count(hFile)) g_CurrentOffset[hFile] = offset;
+        LeaveCriticalSection(&g_CriticalSection);
+    }
     return res;
 }
 
 BOOL WINAPI HookedSetFilePointerEx(HANDLE hFile, LARGE_INTEGER liDist, PLARGE_INTEGER pNew, DWORD dwMethod) {
     BOOL res = OriginalSetFilePointerEx(hFile, liDist, pNew, dwMethod);
-    if (res && pNew) { EnterCriticalSection(&g_CriticalSection); if (g_IMGHandles.count(hFile)) g_CurrentOffset[hFile] = pNew->LowPart; LeaveCriticalSection(&g_CriticalSection); }
+    if (res && pNew) { EnterCriticalSection(&g_CriticalSection); if (g_IMGHandles.count(hFile)) g_CurrentOffset[hFile] = static_cast<uint64_t>(pNew->QuadPart); LeaveCriticalSection(&g_CriticalSection); }
     return res;
 }
 
@@ -389,41 +479,209 @@ DWORD WINAPI HookedGetFileAttributesW(LPCWSTR lpFileName) {
 }
 
 BOOL WINAPI HookedReadFile(HANDLE hFile, LPVOID lpBuffer, DWORD nBytesToRead, LPDWORD pBytesRead, LPOVERLAPPED lpOver) {
-    std::string modPath = "";
-    bool isOverlapped = (lpOver != nullptr);
+    std::string archiveKey;
+    std::string archivePath;
+    CompletionPortAssociation completionPort = {};
+    bool hasCompletionPort = false;
+    uint64_t offset = 0;
+    uint64_t requestEnd = 0;
+    struct ReplacementRange {
+        uint64_t start;
+        uint64_t end;
+        std::string modPath;
+        uint64_t modSize;
+    };
+    std::vector<ReplacementRange> replacements;
 
     EnterCriticalSection(&g_CriticalSection);
     auto it = g_IMGHandles.find(hFile);
     if (it != g_IMGHandles.end()) {
-        std::string imgKey = it->second;
-        uint32_t offset = isOverlapped ? lpOver->Offset : g_CurrentOffset[hFile];
-        uint32_t sectorOffset = offset / SECTOR_SIZE;
+        archiveKey = it->second;
+        auto pathIt = g_IMGPaths.find(hFile);
+        if (pathIt != g_IMGPaths.end()) archivePath = pathIt->second;
+        auto completionIt = g_CompletionPortAssociations.find(hFile);
+        if (completionIt != g_CompletionPortAssociations.end()) {
+            completionPort = completionIt->second;
+            hasCompletionPort = true;
+        }
+        offset = lpOver
+            ? (static_cast<uint64_t>(lpOver->OffsetHigh) << 32) | lpOver->Offset
+            : g_CurrentOffset[hFile];
 
-        auto virtIt = g_FakeOffsetLookup.find(sectorOffset);
-        if (virtIt != g_FakeOffsetLookup.end()) modPath = virtIt->second->modPath;
-        else {
-            auto stdIt = g_StandardReplacements.find(imgKey);
-            if (stdIt != g_StandardReplacements.end()) {
-                auto repIt = stdIt->second.find(offset);
-                if (repIt != stdIt->second.end()) modPath = repIt->second.modPath;
+        requestEnd = offset + nBytesToRead;
+        if (requestEnd < offset) requestEnd = UINT64_MAX;
+        auto standardEntries = g_StandardReplacements.find(archiveKey);
+        if (standardEntries != g_StandardReplacements.end()) {
+            auto entry = standardEntries->second.lower_bound(offset);
+            if (entry != standardEntries->second.begin()) --entry;
+            for (; entry != standardEntries->second.end() && entry->first < requestEnd; ++entry) {
+                uint64_t end = entry->first + entry->second.originalSize;
+                if (end > offset) {
+                    replacements.push_back({ entry->first, end, entry->second.modPath, entry->second.modSize });
+                }
+            }
+        }
+        auto virtualEntries = g_VirtualEntries.find(archiveKey);
+        if (virtualEntries != g_VirtualEntries.end()) {
+            for (const auto& entry : virtualEntries->second) {
+                uint64_t start = static_cast<uint64_t>(entry.first) * SECTOR_SIZE;
+                uint64_t end = start + static_cast<uint64_t>(entry.second.sizeInSectors) * SECTOR_SIZE;
+                if (start < requestEnd && end > offset) {
+                    replacements.push_back({ start, end, entry.second.modPath, entry.second.modSize });
+                }
             }
         }
     }
     LeaveCriticalSection(&g_CriticalSection);
 
-    if (!modPath.empty()) {
-        std::ifstream modFile(modPath, std::ios::binary);
-        if (modFile.is_open()) {
-            memset(lpBuffer, 0, nBytesToRead);
-            modFile.read(static_cast<char*>(lpBuffer), nBytesToRead);
-            DWORD bytesRead = static_cast<DWORD>(modFile.gcount());
-            if (pBytesRead) *pBytesRead = bytesRead;
-            if (lpOver && lpOver->hEvent) SetEvent(lpOver->hEvent);
-            else { EnterCriticalSection(&g_CriticalSection); g_CurrentOffset[hFile] += bytesRead; LeaveCriticalSection(&g_CriticalSection); }
-            return TRUE;
+    if (!replacements.empty()) {
+        if (nBytesToRead > 0 && !lpBuffer) {
+            SetLastError(ERROR_INVALID_USER_BUFFER);
+            return FALSE;
         }
+        if (archivePath.empty()) {
+            Log("ERROR: Missing backing archive path for replacement read [" + archiveKey + "].");
+            SetLastError(ERROR_FILE_NOT_FOUND);
+            return FALSE;
+        }
+        HANDLE backingFile = OriginalCreateFileA(
+            archivePath.c_str(),
+            GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            nullptr,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            nullptr);
+        if (backingFile == INVALID_HANDLE_VALUE) {
+            DWORD error = GetLastError();
+            Log("ERROR: Unable to open backing archive for replacement read: " + archivePath);
+            SetLastError(error);
+            return FALSE;
+        }
+        if (nBytesToRead > 0) memset(lpBuffer, 0, nBytesToRead);
+        LARGE_INTEGER archiveOffset;
+        archiveOffset.QuadPart = static_cast<LONGLONG>(offset);
+        BOOL readResult = OriginalSetFilePointerEx(backingFile, archiveOffset, nullptr, FILE_BEGIN);
+        DWORD backingBytesRead = 0;
+        if (readResult) {
+            readResult = OriginalReadFile(backingFile, lpBuffer, nBytesToRead, &backingBytesRead, nullptr);
+        }
+        DWORD readError = readResult ? NO_ERROR : GetLastError();
+        CloseHandle(backingFile);
+        if (!readResult) {
+            Log("ERROR: Unable to read backing archive for replacement read: " + archivePath);
+            SetLastError(readError);
+            return FALSE;
+        }
+
+        for (const ReplacementRange& replacement : replacements) {
+            uint64_t overlapStart = (std::max)(offset, replacement.start);
+            uint64_t overlapEnd = (std::min)(requestEnd, replacement.end);
+            if (overlapStart >= overlapEnd) continue;
+            uint64_t overlapLength = overlapEnd - overlapStart;
+            DWORD targetOffset = static_cast<DWORD>(overlapStart - offset);
+            DWORD targetLength = static_cast<DWORD>(overlapLength);
+            memset(static_cast<char*>(lpBuffer) + targetOffset, 0, targetLength);
+            if (overlapStart >= replacement.start &&
+                overlapStart - replacement.start < replacement.modSize) {
+                uint64_t sourceOffset = overlapStart - replacement.start;
+                DWORD sourceLength = static_cast<DWORD>(
+                    std::min<uint64_t>(overlapLength, replacement.modSize - sourceOffset));
+                std::ifstream modFile(replacement.modPath, std::ios::binary);
+                if (!modFile.is_open()) {
+                    Log("ERROR: Unable to open replacement file: " + replacement.modPath);
+                    SetLastError(ERROR_FILE_NOT_FOUND);
+                    return FALSE;
+                }
+                modFile.seekg(static_cast<std::streamoff>(sourceOffset));
+                if (!modFile) {
+                    Log("ERROR: Unable to seek replacement file: " + replacement.modPath);
+                    SetLastError(ERROR_READ_FAULT);
+                    return FALSE;
+                }
+                modFile.read(static_cast<char*>(lpBuffer) + targetOffset, sourceLength);
+                if (static_cast<DWORD>(modFile.gcount()) != sourceLength || modFile.bad()) {
+                    Log("ERROR: Replacement file changed or was truncated while reading: " + replacement.modPath);
+                    SetLastError(ERROR_HANDLE_EOF);
+                    return FALSE;
+                }
+            }
+
+            std::string readKey = archiveKey + "|" + replacement.modPath;
+            bool logRead = false;
+            EnterCriticalSection(&g_CriticalSection);
+            logRead = g_LoggedReplacementReads.insert(readKey).second;
+            LeaveCriticalSection(&g_CriticalSection);
+            if (logRead) {
+                Log("Replacement read [" + archiveKey + "]: " + replacement.modPath +
+                    " at archive offset " + std::to_string(offset) +
+                    " (replacement range " + std::to_string(replacement.start) + "-" +
+                    std::to_string(replacement.end) + ", requested " +
+                    std::to_string(nBytesToRead) + ", source " +
+                    std::to_string(replacement.modSize) + ", " +
+                    (lpOver ? "overlapped" : "synchronous") + ").");
+            }
+        }
+
+        DWORD bytesRead = nBytesToRead;
+        if (pBytesRead) *pBytesRead = bytesRead;
+        if (lpOver) {
+            lpOver->Internal = 0;
+            lpOver->InternalHigh = bytesRead;
+            ULONG_PTR eventValue = reinterpret_cast<ULONG_PTR>(lpOver->hEvent);
+            HANDLE eventHandle = reinterpret_cast<HANDLE>(eventValue & ~static_cast<ULONG_PTR>(1));
+            bool suppressCompletionPort = (eventValue & 1) != 0;
+            if (eventHandle && !SetEvent(eventHandle)) {
+                DWORD error = GetLastError();
+                Log("ERROR: Unable to signal overlapped replacement read.");
+                SetLastError(error);
+                return FALSE;
+            }
+            if (hasCompletionPort && !suppressCompletionPort &&
+                !PostQueuedCompletionStatus(completionPort.port, bytesRead, completionPort.completionKey, lpOver)) {
+                DWORD error = GetLastError();
+                Log("ERROR: Unable to queue overlapped replacement completion.");
+                SetLastError(error);
+                return FALSE;
+            }
+        }
+        else {
+            LARGE_INTEGER nextOffset;
+            nextOffset.QuadPart = static_cast<LONGLONG>(offset + bytesRead);
+            OriginalSetFilePointerEx(hFile, nextOffset, nullptr, FILE_BEGIN);
+            EnterCriticalSection(&g_CriticalSection);
+            if (g_IMGHandles.count(hFile)) g_CurrentOffset[hFile] = offset + bytesRead;
+            LeaveCriticalSection(&g_CriticalSection);
+        }
+        return TRUE;
     }
-    return OriginalReadFile(hFile, lpBuffer, nBytesToRead, pBytesRead, lpOver);
+    DWORD bytesRead = 0;
+    LPDWORD bytesReadPointer = pBytesRead ? pBytesRead : &bytesRead;
+    BOOL result = OriginalReadFile(hFile, lpBuffer, nBytesToRead, bytesReadPointer, lpOver);
+    if (result && !lpOver) {
+        EnterCriticalSection(&g_CriticalSection);
+        if (g_IMGHandles.count(hFile)) g_CurrentOffset[hFile] = offset + *bytesReadPointer;
+        LeaveCriticalSection(&g_CriticalSection);
+    }
+    return result;
+}
+
+HANDLE WINAPI HookedCreateIoCompletionPort(
+    HANDLE hFile,
+    HANDLE hExistingCompletionPort,
+    ULONG_PTR dwCompletionKey,
+    DWORD dwNumberOfConcurrentThreads) {
+    HANDLE completionPort = OriginalCreateIoCompletionPort(
+        hFile,
+        hExistingCompletionPort,
+        dwCompletionKey,
+        dwNumberOfConcurrentThreads);
+    if (completionPort && hFile != INVALID_HANDLE_VALUE) {
+        EnterCriticalSection(&g_CriticalSection);
+        g_CompletionPortAssociations[hFile] = { completionPort, dwCompletionKey };
+        LeaveCriticalSection(&g_CriticalSection);
+    }
+    return completionPort;
 }
 
 // ============================================================================
@@ -447,6 +705,7 @@ void InitializeHooks() {
     MH_CreateHook(&SetFilePointerEx, &HookedSetFilePointerEx, (LPVOID*)&OriginalSetFilePointerEx); MH_EnableHook(&SetFilePointerEx);
     MH_CreateHook(&GetFileSize, &HookedGetFileSize, (LPVOID*)&OriginalGetFileSize); MH_EnableHook(&GetFileSize);
     MH_CreateHook(&GetFileSizeEx, &HookedGetFileSizeEx, (LPVOID*)&OriginalGetFileSizeEx); MH_EnableHook(&GetFileSizeEx);
+    MH_CreateHook(&CreateIoCompletionPort, &HookedCreateIoCompletionPort, (LPVOID*)&OriginalCreateIoCompletionPort); MH_EnableHook(&CreateIoCompletionPort);
 
     Log("All hooks enabled. Modloader is fully ready.");
 }
